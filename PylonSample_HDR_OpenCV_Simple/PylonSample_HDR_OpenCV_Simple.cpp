@@ -1,5 +1,5 @@
 /*
-// PylonSample_HDR_OpenCV.cpp
+// PylonSample_HDR_OpenCV_Simple.cpp
 // Demostrates using OpenCV's Exposure Fusion tools with Basler cameras and drivers to create an HDR image.
 // Copyright (c) 2019 Matthew Breit - matt.breit@baslerweb.com or matt.breit@gmail.com
 //
