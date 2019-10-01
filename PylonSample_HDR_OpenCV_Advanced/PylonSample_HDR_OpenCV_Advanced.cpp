@@ -1,6 +1,9 @@
 /*
-// PylonSample_HDR_OpenCV_Simple.cpp
+// PylonSample_HDR_OpenCV_Advanced.cpp
+//
 // Demostrates using OpenCV's Exposure Fusion tools with Basler cameras and drivers to create an HDR image.
+// This sample uses the camera's Sequencer feature to setup the camera to take multiple different images with one trigger.
+//
 // Copyright (c) 2019 Matthew Breit - matt.breit@baslerweb.com or matt.breit@gmail.com
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -78,6 +81,49 @@ static const double c_lowExposureTime = 100;
 // Highest exposure time we will use for HDR (in microseconds)
 static const double c_highExposureTime = 100000;
 
+using namespace std;
+
+// The function which will generate the "HDR" image from a set of images.
+void CreateHDR(std::vector<Pylon::CPylonImage> &images, Pylon::CPylonImage &OutputImage)
+{
+	// we will use pylon's image format converter to convert the image to openCV format.
+	Pylon::CImageFormatConverter myConverter;
+	Pylon::PixelType openCVPixelType = Pylon::EPixelType::PixelType_BGR8packed;
+	myConverter.OutputPixelFormat.SetValue(openCVPixelType);
+
+	// Step 1: Convert all stored pylon images to opencv format
+	std::vector<cv::Mat> cv_images;
+	for (int i = 0; i < images.size(); i++)
+	{
+		Pylon::CPylonImage convertedImage;
+		myConverter.Convert(convertedImage, images[i]);
+		cv::Mat cv_image(convertedImage.GetHeight(), convertedImage.GetWidth(), CV_8UC3, (uint8_t*)convertedImage.GetBuffer());
+		cv_images.push_back(cv_image.clone());
+	}
+
+	// merge_mertens will perform the exposure fusion to get the HDR image
+	cv::Ptr<cv::MergeMertens> mergeMertens = cv::createMergeMertens();
+	cv::Ptr<cv::AlignMTB> alignMTB = cv::createAlignMTB();
+
+	// Step 2: align the images (in case the camera moved. But this decreases speed and modifies the final image size)
+	// OPTIMIZATION: If speed is preferred over image quality, comment this out.
+	// alignMTB->process(cv_images, cv_images);
+
+	// Step 3: Create the HDR image
+	cv::Mat fusion;
+	mergeMertens->process(cv_images, fusion);
+	cv::Mat hdrMat;
+	fusion.convertTo(hdrMat, CV_8UC3, 255);
+
+	// Step 4: recovert the HDR image to a pylon image and display it
+	Pylon::CPylonImage hdrImage;
+	hdrImage.AttachUserBuffer(hdrMat.data, (hdrMat.total() * hdrMat.elemSize()), openCVPixelType, hdrMat.cols, hdrMat.rows, 0);
+	OutputImage.CopyImage(hdrImage);
+
+	// Step 5: Clean up for the next HDR image
+	cv_images.clear();
+}
+
 int main(int argc, char* argv[])
 {
 	// The exit code of the sample application.
@@ -93,7 +139,7 @@ int main(int argc, char* argv[])
 
 		// Use a DeviceInfo object to open a specific camera.
 		Pylon::CDeviceInfo info;
-		info.SetSerialNumber("21734321");
+		info.SetSerialNumber("21792244");
 
 		// Create an instant camera object with the given info.
 		Camera_t camera(Pylon::CTlFactory::GetInstance().CreateFirstDevice(info));
@@ -104,30 +150,73 @@ int main(int argc, char* argv[])
 		// Open the camera to gain access to parameters
 		camera.Open();
 
-		// Setup the trigger mechanism
-		camera.TriggerMode.SetValue(TriggerMode_On);
-		camera.TriggerSource.SetValue(TriggerSourceEnums::TriggerSource_Software);
-
-		// The first image will have the low exposure
-		camera.ExposureTime.SetValue(c_lowExposureTime);
-
 		// calculate the exposure time increments for the subsequent images
 		double c_exposureTimeIncrement = (c_highExposureTime - c_lowExposureTime) / c_imagesPerHDR;
 
-		// we will use pylon's image format converter to convert the image to openCV format.
-		Pylon::CImageFormatConverter myConverter;
-		Pylon::PixelType openCVPixelType = Pylon::EPixelType::PixelType_BGR8packed;
-		myConverter.OutputPixelFormat.SetValue(openCVPixelType);
+		// ********************************** BEGIN SEQUENCER SETUP **********************************
 
+		// check if camera supports the sequencer first
+		if (GenApi::IsWritable(camera.SequencerMode.GetNode()) == false)
+		{
+			cout << "This camera does not support the Sequencer feature. Exiting..." << endl;
+			return 1;
+		}
+
+		// Turn off the sequencer so we can configure it
+		camera.SequencerMode.FromString("Off");
+
+		// Put the sequencer into configuration mode so we can cofigure it
+		camera.SequencerConfigurationMode.FromString("On");
+
+		for (int i = 0; i < c_imagesPerHDR; i++)
+		{
+			// We will start by configuring sequencer set 0
+			camera.SequencerSetSelector.SetValue(i);
+
+			// Now change some camera settings settings
+			// The first image will have the low exposure, the last the highest, and the ones in between have an increment
+			if (i == 0)
+				camera.ExposureTime.SetValue(c_lowExposureTime);
+			else if (i == (c_imagesPerHDR - 1))
+				camera.ExposureTime.SetValue(c_highExposureTime);
+			else
+				camera.ExposureTime.SetValue(camera.ExposureTime.GetValue() + c_exposureTimeIncrement);
+
+			// We will advance to the next sequencer set when this one has acquired it's image.
+			// and we will cycle back to the first sequence set after we've run through all of them.
+			if (i == (c_imagesPerHDR - 1))
+				camera.SequencerSetNext.SetValue(0);
+			else
+				camera.SequencerSetNext.SetValue(i + 1);
+
+			camera.SequencerPathSelector.SetValue(1);
+			
+			// Save the sequence set
+			camera.SequencerSetSave.Execute();
+		}
+
+		// Now point the sequencer to start at the first set
+		camera.SequencerSetSelector.SetValue(0);
+
+		// Take the sequencer out of configuration mode
+		camera.SequencerConfigurationMode.FromString("Off");
+
+		// Turn on the sequencer
+		camera.SequencerMode.FromString("On");
+
+		// ********************************** END SEQUENCER SETUP **********************************
+
+		// Setup the trigger mechanism
+		camera.TriggerSelector.SetValue(TriggerSelector_FrameBurstStart);
+		camera.AcquisitionBurstFrameCount.SetValue(c_imagesPerHDR);
+		camera.TriggerMode.SetValue(TriggerMode_On);
+		camera.TriggerSource.SetValue(TriggerSourceEnums::TriggerSource_Software);
+	
 		Pylon::CPylonImage image; // Pylon image to hold an individual incoming image
 		std::vector<Pylon::CPylonImage> images; // vector to store the incoming images we will process
 
 		// DEMO: We can show the user a 'progress bar' of individual images stitched together.
-		Pylon::CPylonImage stitchedImage;
-
-		// merge_mertens will perform the exposure fusion to get the HDR image
-		cv::Ptr<cv::MergeMertens> mergeMertens = cv::createMergeMertens();
-		cv::Ptr<cv::AlignMTB> alignMTB = cv::createAlignMTB();
+		Pylon::CPylonImage stitchedImage;		
 
 		// how we will keep track of the images
 		int imageCounter = 0;
@@ -142,11 +231,11 @@ int main(int argc, char* argv[])
 		GrabResultPtr_t ptrGrabResult;
 
 		// ********************************** END SETUP **********************************
-		
+
 		// Start the Grab Engine (StopGrabbing() will be called automatically when c_countOfImagesToGrab have been grabbed).
 		camera.StartGrabbing(c_countOfImagesToGrab);
 
-		// Start physical image Acquisition by triggering the Camera (we'll send subsequent triggers later as we get images)		
+		// Send a kickoff trigger. Subsequent triggers will be sent later in the Grab Loop.
 		camera.TriggerSoftware.Execute();
 
 		// GRAB LOOP: Here we will retrieve images from the Grab Engine and process them.
@@ -159,21 +248,7 @@ int main(int argc, char* argv[])
 			if (ptrGrabResult->GrabSucceeded())
 			{
 				imageCounter++;
-
-				// OPTIMIZATION:
-				// We can already trigger the camera again and expose the next image while we work on this one.
-				if (imageCounter != c_imagesPerHDR)
-				{
-					// if we don't have all the images, set the next exposure time
-					camera.ExposureTime.SetValue(camera.ExposureTime.GetValue() + c_exposureTimeIncrement);
-					camera.TriggerSoftware.Execute();
-				}
-				if (imageCounter == c_imagesPerHDR)
-				{
-					// if we do have all the images, start the next batch with the low exposure time
-					camera.ExposureTime.SetValue(c_lowExposureTime);
-					camera.TriggerSoftware.Execute();
-				}
+				std::cout << "Image " << imageCounter << " Retrieved." << std::endl;
 
 				// Store this image.
 				image.CopyImage(ptrGrabResult);
@@ -191,41 +266,26 @@ int main(int argc, char* argv[])
 				// The grab result failed. Show the error message that came with it.
 				std::cout << "Error: " << ptrGrabResult->GetErrorCode() << " " << ptrGrabResult->GetErrorDescription() << std::endl;
 			}
-
-			// Once we have all the images, do HDR processing
+					
+			// Once we have all the images, do HDR processing	
 			if (images.size() == c_imagesPerHDR)
 			{
-				// Step 1: Convert all stored pylon images to opencv format
-				std::vector<cv::Mat> cv_images;
-				for (int i = 0; i < images.size(); i++)
-				{
-					Pylon::CPylonImage convertedImage;
-					myConverter.Convert(convertedImage, images[i]);
-					cv::Mat cv_image(convertedImage.GetHeight(), convertedImage.GetWidth(), CV_8UC3, (uint8_t*)convertedImage.GetBuffer());
-					cv_images.push_back(cv_image.clone());
-				}
+				// First, we can now send another trigger to the camera to get a head start on the next batch of images.
+				cout << "Received all images. Sending trigger for next batch..." << endl;
+				camera.TriggerSoftware.Execute();
 
-				// Step 2: align the images (in case the camera moved. But this decreases speed and modifies the final image size)
-				// OPTIMIZATION: If speed is preferred over image quality, comment this out.
-				// alignMTB->process(cv_images, cv_images);
-
-				// Step 3: Create the HDR image
-				cv::Mat fusion;
-				mergeMertens->process(cv_images, fusion);
-				cv::Mat hdrMat;
-				fusion.convertTo(hdrMat, CV_8UC3, 255);
-
-				// Step 4: recovert the HDR image to a pylon image and display it
+				// Create and display the HDR Image.
+				std::cout << "Generating HDR Image for current batch..." << std::endl;
 				Pylon::CPylonImage hdrImage;
-				hdrImage.AttachUserBuffer(hdrMat.data, (hdrMat.total() * hdrMat.elemSize()), openCVPixelType, hdrMat.cols, hdrMat.rows, 0);
+				CreateHDR(images, hdrImage);
 				Pylon::DisplayImage(0, hdrImage);
+				std::cout << "HDR Image Generated!" << std::endl;
+				std::cout << std::endl;
 
-				// Step 5: Clean up for the next HDR image
+				// Clean up for the next run
 				imageCounter = 0;
-				cv_images.clear();
 				images.clear();
 			}
-
 		}
 	}
 	catch (GenICam::GenericException &e)
